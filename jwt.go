@@ -71,6 +71,7 @@ type JwtPlugin struct {
 	required           bool
 	jwkEndpoints       []*url.URL
 	keys               map[string]interface{}
+	constKeys          map[string]interface{}
 	alg                string
 	opaHeaders         map[string]string
 	jwtHeaders         map[string]string
@@ -186,6 +187,7 @@ func New(ctx context.Context, next http.Handler, config *Config, pluginName stri
 		required:           config.Required,
 		alg:                config.Alg,
 		keys:               make(map[string]interface{}),
+		constKeys:          make(map[string]interface{}),
 		opaHeaders:         config.OpaHeaders,
 		jwtHeaders:         config.JwtHeaders,
 		jwksHeaders:        config.JwksHeaders,
@@ -222,14 +224,36 @@ func (jwtPlugin *JwtPlugin) BackgroundRefresh() {
 		select {
 		case keysFetchedChan := <-jwtPlugin.forceRefreshCmd:
 			jwtPlugin.FetchKeys()
-			keysFetchedChan <- struct{}{}
+			remCbChans := jwtPlugin.collectRemainingForceRefreshCmds()
+			for _, cbChan := range append(remCbChans, keysFetchedChan) {
+				cbChan <- struct{}{}
+				close(cbChan)
+			}
 		case <-jwtPlugin.cancelCtx.Done():
 			logInfo(fmt.Sprintf("Quit BackgroundRefresh for %s", jwtPlugin.name)).print()
 			return
 		case <-time.After(15 * time.Minute):
 			jwtPlugin.FetchKeys()
+			cbChans := jwtPlugin.collectRemainingForceRefreshCmds()
+			for _, cbChan := range cbChans {
+				cbChan <- struct{}{}
+				close(cbChan)
+			}
 		}
 	}
+}
+
+func (jwtPlugin *JwtPlugin) collectRemainingForceRefreshCmds() (cbChans []chan<- struct{}) {
+	noCmd := false
+	for !noCmd {
+		select {
+		case c := <-jwtPlugin.forceRefreshCmd:
+			cbChans = append(cbChans, c)
+		default:
+			noCmd = true
+		}
+	}
+	return
 }
 
 func (jwtPlugin *JwtPlugin) forceRefreshKeys() (refreshed bool) {
@@ -237,16 +261,23 @@ func (jwtPlugin *JwtPlugin) forceRefreshKeys() (refreshed bool) {
 		return
 	}
 	refreshedCh := make(chan struct{})
-	jwtPlugin.forceRefreshCmd <- refreshedCh
-	<-refreshedCh
+	select {
+	case jwtPlugin.forceRefreshCmd <- refreshedCh:
+	case <-time.After(10 * time.Second):
+		logInfo(fmt.Sprintf("failed to force refresh keys for %s: send commmand timed out", jwtPlugin.name)).print()
+		return
+	}
+	select {
+	case <-refreshedCh:
+	case <-time.After(10 * time.Second):
+		logInfo(fmt.Sprintf("failed to force refresh keys for %s: receive msg timed out", jwtPlugin.name)).print()
+		return
+	}
 	refreshed = true
 	return
 }
 
 func (jwtPlugin *JwtPlugin) ParseKeys(certificates []string) error {
-	jwtPlugin.keysLock.Lock()
-	defer jwtPlugin.keysLock.Unlock()
-
 	for _, certificate := range certificates {
 		if block, rest := pem.Decode([]byte(certificate)); block != nil {
 			if len(rest) > 0 {
@@ -257,13 +288,13 @@ func (jwtPlugin *JwtPlugin) ParseKeys(certificates []string) error {
 				if err != nil {
 					return fmt.Errorf("failed to parse a PEM certificate: %v", err)
 				}
-				jwtPlugin.keys[base64.RawURLEncoding.EncodeToString(cert.SubjectKeyId)] = cert.PublicKey
+				jwtPlugin.constKeys[base64.RawURLEncoding.EncodeToString(cert.SubjectKeyId)] = cert.PublicKey
 			} else if block.Type == "PUBLIC KEY" || block.Type == "RSA PUBLIC KEY" {
 				key, err := x509.ParsePKIXPublicKey(block.Bytes)
 				if err != nil {
 					return fmt.Errorf("failed to parse a PEM public key: %v", err)
 				}
-				jwtPlugin.keys[strconv.Itoa(len(jwtPlugin.keys))] = key
+				jwtPlugin.constKeys[strconv.Itoa(len(jwtPlugin.constKeys))] = key
 			} else {
 				return fmt.Errorf("failed to extract a Key from the PEM certificate")
 			}
@@ -272,6 +303,13 @@ func (jwtPlugin *JwtPlugin) ParseKeys(certificates []string) error {
 		} else {
 			return fmt.Errorf("Invalid configuration, expecting a certificate, public key or JWK URL")
 		}
+	}
+
+	jwtPlugin.keysLock.Lock()
+	defer jwtPlugin.keysLock.Unlock()
+
+	for k, v := range jwtPlugin.constKeys {
+		jwtPlugin.keys[k] = v
 	}
 	return nil
 }
@@ -391,8 +429,13 @@ func (jwtPlugin *JwtPlugin) FetchKeys() {
 	jwtPlugin.keysLock.Lock()
 	defer jwtPlugin.keysLock.Unlock()
 
-	for k, v := range fetchedKeys {
-		jwtPlugin.keys[k] = v
+	switch {
+	case len(fetchedKeys) == 0:
+	default:
+		jwtPlugin.keys = fetchedKeys
+		for k, v := range jwtPlugin.constKeys {
+			jwtPlugin.keys[k] = v
+		}
 	}
 }
 
