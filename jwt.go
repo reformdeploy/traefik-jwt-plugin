@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -224,52 +225,53 @@ func (jwtPlugin *JwtPlugin) BackgroundRefresh() {
 		select {
 		case keysFetchedChan := <-jwtPlugin.forceRefreshCmd:
 			jwtPlugin.FetchKeys()
-			remCbChans := jwtPlugin.collectRemainingForceRefreshCmds()
-			for _, cbChan := range append(remCbChans, keysFetchedChan) {
-				cbChan <- struct{}{}
-				close(cbChan)
-			}
+			jwtPlugin.ackCurrentForceRefreshCmds(keysFetchedChan)
 		case <-jwtPlugin.cancelCtx.Done():
 			logInfo(fmt.Sprintf("Quit BackgroundRefresh for %s", jwtPlugin.name)).print()
 			return
 		case <-time.After(15 * time.Minute):
 			jwtPlugin.FetchKeys()
-			cbChans := jwtPlugin.collectRemainingForceRefreshCmds()
-			for _, cbChan := range cbChans {
-				cbChan <- struct{}{}
-				close(cbChan)
-			}
+			jwtPlugin.ackCurrentForceRefreshCmds()
 		}
 	}
 }
 
-func (jwtPlugin *JwtPlugin) collectRemainingForceRefreshCmds() (cbChans []chan<- struct{}) {
-	noCmd := false
-	for !noCmd {
+// ackCurrentForceRefreshCmds acknowledge all current requested commands of forcing refresh keys
+func (jwtPlugin *JwtPlugin) ackCurrentForceRefreshCmds(consumedCmds ...chan<- struct{}) {
+	ackCmd := func(c chan<- struct{}) {
+		c <- struct{}{}
+	}
+	for _, c := range consumedCmds {
+		go ackCmd(c)
+	}
+	for {
 		select {
 		case c := <-jwtPlugin.forceRefreshCmd:
-			cbChans = append(cbChans, c)
+			go ackCmd(c)
 		default:
-			noCmd = true
+			return
 		}
 	}
-	return
 }
 
 func (jwtPlugin *JwtPlugin) forceRefreshKeys() (refreshed bool) {
 	if jwtPlugin.forceRefreshCmd == nil || len(jwtPlugin.jwkEndpoints) == 0 {
 		return
 	}
-	refreshedCh := make(chan struct{})
+	if errors.Is(jwtPlugin.cancelCtx.Err(), context.Canceled) {
+		logError("this JwtPlugin instance has been cancelled").print()
+		return
+	}
+	refreshedCh := make(chan struct{}, 1)
 	select {
 	case jwtPlugin.forceRefreshCmd <- refreshedCh:
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 		logInfo(fmt.Sprintf("failed to force refresh keys for %s: send commmand timed out", jwtPlugin.name)).print()
 		return
 	}
 	select {
 	case <-refreshedCh:
-	case <-time.After(10 * time.Second):
+	case <-time.After(5 * time.Second):
 		logInfo(fmt.Sprintf("failed to force refresh keys for %s: receive msg timed out", jwtPlugin.name)).print()
 		return
 	}
