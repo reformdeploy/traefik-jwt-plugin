@@ -48,6 +48,8 @@ func (m MiddlewarePluginManager) OnPluginLoaded(ctx context.Context, jwtPlugin *
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 	jwtPlugin.cancelCtx = cancelCtx
 	m[jwtPlugin.middlewareName][jwtPlugin.identifier] = cancelFunc
+
+	logInfo(fmt.Sprintf("JwtPlugin (id: %s) loaded for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
 }
 
 func (m MiddlewarePluginManager) SelectPluginForMiddleware(jwtPlugin *JwtPlugin) {
@@ -56,10 +58,16 @@ func (m MiddlewarePluginManager) SelectPluginForMiddleware(jwtPlugin *JwtPlugin)
 	}
 	for pluginId, cancelFunc := range m[jwtPlugin.middlewareName] {
 		if pluginId != jwtPlugin.identifier {
+			logInfo(fmt.Sprintf("JwtPlugin (id: %s) cancelled for middleware %s", pluginId, jwtPlugin.middlewareName)).print()
 			cancelFunc()
 			delete(m[jwtPlugin.middlewareName], pluginId)
 		}
 	}
+	if jwtPlugin.forceRefreshCmd != nil {
+		go jwtPlugin.BackgroundRefresh()
+	}
+
+	logInfo(fmt.Sprintf("JwtPlugin (id: %s) selected for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
 }
 
 // Manager of plugin instances for each middleware. When a new configuration is loaded, the instance will be added to middleware map; when ServeHTTP of any plugin instance is called, this instance will be selected for the middleware and other instances will be cancelled & deleted, and background refresh routine stopped
@@ -233,6 +241,7 @@ func New(ctx context.Context, next http.Handler, config *Config, middlewareName 
 		jwtQueryKey:        config.JwtQueryKey,
 		middlewareName:     middlewareName,
 	}
+	pluginInstManager.OnPluginLoaded(ctx, jwtPlugin)
 
 	if len(config.Keys) > 0 {
 		if err := jwtPlugin.ParseKeys(config.Keys); err != nil {
@@ -242,8 +251,6 @@ func New(ctx context.Context, next http.Handler, config *Config, middlewareName 
 			if config.ForceRefreshKeys {
 				jwtPlugin.forceRefreshCmd = make(chan chan<- struct{})
 			}
-			pluginInstManager.OnPluginLoaded(ctx, jwtPlugin)
-			go jwtPlugin.BackgroundRefresh()
 		}
 	}
 	return jwtPlugin, nil
