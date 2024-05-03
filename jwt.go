@@ -29,8 +29,41 @@ import (
 	"time"
 )
 
-// map of cancel  functions for background refresh. whe a new configuration is loaded, the old background refresh with the same name is cancelled
-var backgroundRefreshCancel map[string]context.CancelFunc = make(map[string]context.CancelFunc)
+type MiddlewarePluginManager map[string]map[string]context.CancelFunc
+
+func (m MiddlewarePluginManager) OnPluginLoaded(ctx context.Context, jwtPlugin *JwtPlugin) {
+	if _, ok := m[jwtPlugin.middlewareName]; !ok {
+		m[jwtPlugin.middlewareName] = make(map[string]context.CancelFunc)
+	}
+	if len(jwtPlugin.identifier) == 0 {
+		for {
+			b := make([]byte, 16)
+			rand.Read(b)
+			jwtPlugin.identifier = fmt.Sprintf("%X", b)
+			if _, ok := m[jwtPlugin.middlewareName][jwtPlugin.identifier]; !ok {
+				break
+			}
+		}
+	}
+	cancelCtx, cancelFunc := context.WithCancel(ctx)
+	jwtPlugin.cancelCtx = cancelCtx
+	m[jwtPlugin.middlewareName][jwtPlugin.identifier] = cancelFunc
+}
+
+func (m MiddlewarePluginManager) SelectPluginForMiddleware(jwtPlugin *JwtPlugin) {
+	if _, ok := m[jwtPlugin.middlewareName]; !ok {
+		m.OnPluginLoaded(context.Background(), jwtPlugin)
+	}
+	for pluginId, cancelFunc := range m[jwtPlugin.middlewareName] {
+		if pluginId != jwtPlugin.identifier {
+			cancelFunc()
+			delete(m[jwtPlugin.middlewareName], pluginId)
+		}
+	}
+}
+
+// Manager of plugin instances for each middleware. When a new configuration is loaded, the instance will be added to middleware map; when ServeHTTP of any plugin instance is called, this instance will be selected for the middleware and other instances will be cancelled & deleted, and background refresh routine stopped
+var pluginInstManager MiddlewarePluginManager = make(map[string]map[string]context.CancelFunc)
 
 // Config the plugin configuration.
 type Config struct {
@@ -83,7 +116,7 @@ type JwtPlugin struct {
 	jwtCookieKey       string
 	jwtQueryKey        string
 
-	name            string
+	middlewareName  string
 	identifier      string
 	keysLock        sync.RWMutex
 	forceRefreshCmd chan chan<- struct{}
@@ -178,7 +211,7 @@ type Response struct {
 }
 
 // New creates a new plugin
-func New(ctx context.Context, next http.Handler, config *Config, pluginName string) (http.Handler, error) {
+func New(ctx context.Context, next http.Handler, config *Config, middlewareName string) (http.Handler, error) {
 	jwtPlugin := &JwtPlugin{
 		httpClient:         &http.Client{},
 		next:               next,
@@ -198,14 +231,8 @@ func New(ctx context.Context, next http.Handler, config *Config, pluginName stri
 		opaHttpStatusField: config.OpaHttpStatusField,
 		jwtCookieKey:       config.JwtCookieKey,
 		jwtQueryKey:        config.JwtQueryKey,
-		name:               pluginName,
+		middlewareName:     middlewareName,
 	}
-	b := make([]byte, 16)
-	_, err := rand.Read(b)
-	if err != nil {
-		return nil, err
-	}
-	jwtPlugin.identifier = fmt.Sprintf("%X", b)
 
 	if len(config.Keys) > 0 {
 		if err := jwtPlugin.ParseKeys(config.Keys); err != nil {
@@ -215,13 +242,7 @@ func New(ctx context.Context, next http.Handler, config *Config, pluginName stri
 			if config.ForceRefreshKeys {
 				jwtPlugin.forceRefreshCmd = make(chan chan<- struct{})
 			}
-			if backgroundRefreshCancel[pluginName] != nil {
-				logInfo(fmt.Sprintf("Cancel BackgroundRefresh %s", pluginName)).print()
-				backgroundRefreshCancel[pluginName]()
-			}
-			cancel, cancelFunc := context.WithCancel(ctx)
-			backgroundRefreshCancel[pluginName] = cancelFunc
-			jwtPlugin.cancelCtx = cancel
+			pluginInstManager.OnPluginLoaded(ctx, jwtPlugin)
 			go jwtPlugin.BackgroundRefresh()
 		}
 	}
@@ -229,7 +250,7 @@ func New(ctx context.Context, next http.Handler, config *Config, pluginName stri
 }
 
 func (jwtPlugin *JwtPlugin) BackgroundRefresh() {
-	logInfo(fmt.Sprintf("Start BackgroundRefresh for %s (id: %s)", jwtPlugin.name, jwtPlugin.identifier)).print()
+	logInfo(fmt.Sprintf("Start BackgroundRefresh for %s (id: %s)", jwtPlugin.middlewareName, jwtPlugin.identifier)).print()
 	jwtPlugin.FetchKeys()
 	for {
 		select {
@@ -237,7 +258,7 @@ func (jwtPlugin *JwtPlugin) BackgroundRefresh() {
 			jwtPlugin.FetchKeys()
 			jwtPlugin.ackCurrentForceRefreshCmds(keysFetchedChan)
 		case <-jwtPlugin.cancelCtx.Done():
-			logInfo(fmt.Sprintf("Quit BackgroundRefresh for %s (id: %s)", jwtPlugin.name, jwtPlugin.identifier)).print()
+			logInfo(fmt.Sprintf("Quit BackgroundRefresh for %s (id: %s)", jwtPlugin.middlewareName, jwtPlugin.identifier)).print()
 			return
 		case <-time.After(15 * time.Minute):
 			jwtPlugin.FetchKeys()
@@ -274,29 +295,29 @@ func (jwtPlugin *JwtPlugin) forceRefreshKeys() (refreshed bool) {
 	if jwtPlugin.forceRefreshCmd == nil || len(jwtPlugin.jwkEndpoints) == 0 {
 		return
 	}
-	logInfo(fmt.Sprintf("Forcing BackgroundRefresh for %s (id: %s, ctxErr: %v)", jwtPlugin.name, jwtPlugin.identifier, jwtPlugin.cancelCtx.Err())).print()
+	logInfo(fmt.Sprintf("Forcing BackgroundRefresh for %s (id: %s, ctxErr: %v)", jwtPlugin.middlewareName, jwtPlugin.identifier, jwtPlugin.cancelCtx.Err())).print()
 
-	if errors.Is(jwtPlugin.cancelCtx.Err(), context.Canceled) {
-		logError(fmt.Sprintf("this JwtPlugin instance %s (id: %s, ctxErr: %v) has been cancelled", jwtPlugin.name, jwtPlugin.identifier, jwtPlugin.cancelCtx.Err())).print()
-		return
-	}
 	defer func() {
 		if !refreshed {
 			jwtPlugin.FetchKeys()
 			jwtPlugin.ackCurrentForceRefreshCmds()
 		}
 	}()
+	if errors.Is(jwtPlugin.cancelCtx.Err(), context.Canceled) {
+		logError(fmt.Sprintf("this JwtPlugin instance %s (id: %s, ctxErr: %v) has been cancelled", jwtPlugin.middlewareName, jwtPlugin.identifier, jwtPlugin.cancelCtx.Err())).print()
+		return
+	}
 	refreshedCh := make(chan struct{}, 1)
 	select {
 	case jwtPlugin.forceRefreshCmd <- refreshedCh:
 	case <-time.After(5 * time.Second):
-		logInfo(fmt.Sprintf("failed to force refresh keys for %s (id: %s): send commmand timed out", jwtPlugin.name, jwtPlugin.identifier)).print()
+		logInfo(fmt.Sprintf("failed to force refresh keys for %s (id: %s): send commmand timed out", jwtPlugin.middlewareName, jwtPlugin.identifier)).print()
 		return
 	}
 	select {
 	case <-refreshedCh:
 	case <-time.After(5 * time.Second):
-		logInfo(fmt.Sprintf("failed to force refresh keys for %s (id: %s): receive msg timed out", jwtPlugin.name, jwtPlugin.identifier)).print()
+		logInfo(fmt.Sprintf("failed to force refresh keys for %s (id: %s): receive msg timed out", jwtPlugin.middlewareName, jwtPlugin.identifier)).print()
 		return
 	}
 	refreshed = true
@@ -466,6 +487,8 @@ func (jwtPlugin *JwtPlugin) FetchKeys() {
 }
 
 func (jwtPlugin *JwtPlugin) ServeHTTP(rw http.ResponseWriter, request *http.Request) {
+	pluginInstManager.SelectPluginForMiddleware(jwtPlugin)
+
 	if st, err := jwtPlugin.CheckToken(request, rw); err != nil {
 		if st >= 300 && st < 600 {
 			http.Error(rw, err.Error(), st)
