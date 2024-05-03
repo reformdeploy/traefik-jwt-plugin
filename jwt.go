@@ -29,49 +29,82 @@ import (
 	"time"
 )
 
-type MiddlewarePluginManager map[string]map[string]context.CancelFunc
+type MiddlewarePlugins struct {
+	selectedPluginId string
+	pluginCancelMap  map[string]context.CancelFunc
+}
 
-func (m MiddlewarePluginManager) OnPluginLoaded(ctx context.Context, jwtPlugin *JwtPlugin) {
-	if _, ok := m[jwtPlugin.middlewareName]; !ok {
-		m[jwtPlugin.middlewareName] = make(map[string]context.CancelFunc)
+func NewMiddlewarePlugins() *MiddlewarePlugins {
+	return &MiddlewarePlugins{
+		pluginCancelMap: make(map[string]context.CancelFunc),
 	}
+}
+
+func (m *MiddlewarePlugins) OnPluginLoaded(ctx context.Context, jwtPlugin *JwtPlugin) {
 	if len(jwtPlugin.identifier) == 0 {
 		for {
 			b := make([]byte, 16)
 			rand.Read(b)
 			jwtPlugin.identifier = fmt.Sprintf("%X", b)
-			if _, ok := m[jwtPlugin.middlewareName][jwtPlugin.identifier]; !ok {
+			if _, ok := m.pluginCancelMap[jwtPlugin.identifier]; !ok {
 				break
 			}
 		}
 	}
 	cancelCtx, cancelFunc := context.WithCancel(ctx)
 	jwtPlugin.cancelCtx = cancelCtx
-	m[jwtPlugin.middlewareName][jwtPlugin.identifier] = cancelFunc
+	m.pluginCancelMap[jwtPlugin.identifier] = cancelFunc
 
 	logInfo(fmt.Sprintf("JwtPlugin (id: %s) loaded for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
 }
 
-func (m MiddlewarePluginManager) SelectPluginForMiddleware(jwtPlugin *JwtPlugin) {
+func (m *MiddlewarePlugins) SelectPlugin(jwtPlugin *JwtPlugin) {
+	go func() {
+		for pluginId, cancelFunc := range m.pluginCancelMap {
+			if pluginId == jwtPlugin.identifier {
+				continue
+			}
+			logInfo(fmt.Sprintf("JwtPlugin (id: %s) cancelled for middleware %s", pluginId, jwtPlugin.middlewareName)).print()
+			cancelFunc()
+			delete(m.pluginCancelMap, pluginId)
+		}
+	}()
+
+	if jwtPlugin.identifier == m.selectedPluginId {
+		return
+	}
+
+	if _, ok := m.pluginCancelMap[jwtPlugin.identifier]; !ok {
+		// should not happen on normal case
+		m.OnPluginLoaded(context.Background(), jwtPlugin)
+	}
+
+	m.selectedPluginId = jwtPlugin.identifier
+	logInfo(fmt.Sprintf("JwtPlugin (id: %s) selected for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
+	if len(jwtPlugin.jwkEndpoints) > 0 {
+		jwtPlugin.FetchKeys()
+		go jwtPlugin.BackgroundRefresh()
+	}
+}
+
+type PluginInstanceManager map[string]*MiddlewarePlugins
+
+func (m PluginInstanceManager) OnPluginLoaded(ctx context.Context, jwtPlugin *JwtPlugin) {
+	if _, ok := m[jwtPlugin.middlewareName]; !ok {
+		m[jwtPlugin.middlewareName] = NewMiddlewarePlugins()
+	}
+	m[jwtPlugin.middlewareName].OnPluginLoaded(ctx, jwtPlugin)
+}
+
+func (m PluginInstanceManager) SelectPluginForMiddleware(jwtPlugin *JwtPlugin) {
 	if _, ok := m[jwtPlugin.middlewareName]; !ok {
 		m.OnPluginLoaded(context.Background(), jwtPlugin)
 	}
-	for pluginId, cancelFunc := range m[jwtPlugin.middlewareName] {
-		if pluginId != jwtPlugin.identifier {
-			logInfo(fmt.Sprintf("JwtPlugin (id: %s) cancelled for middleware %s", pluginId, jwtPlugin.middlewareName)).print()
-			cancelFunc()
-			delete(m[jwtPlugin.middlewareName], pluginId)
-		}
-	}
-	if jwtPlugin.forceRefreshCmd != nil {
-		go jwtPlugin.BackgroundRefresh()
-	}
-
-	logInfo(fmt.Sprintf("JwtPlugin (id: %s) selected for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
+	m[jwtPlugin.middlewareName].SelectPlugin(jwtPlugin)
 }
 
 // Manager of plugin instances for each middleware. When a new configuration is loaded, the instance will be added to middleware map; when ServeHTTP of any plugin instance is called, this instance will be selected for the middleware and other instances will be cancelled & deleted, and background refresh routine stopped
-var pluginInstManager MiddlewarePluginManager = make(map[string]map[string]context.CancelFunc)
+var pluginInstManager PluginInstanceManager = make(map[string]*MiddlewarePlugins)
 
 // Config the plugin configuration.
 type Config struct {
@@ -258,7 +291,6 @@ func New(ctx context.Context, next http.Handler, config *Config, middlewareName 
 
 func (jwtPlugin *JwtPlugin) BackgroundRefresh() {
 	logInfo(fmt.Sprintf("Start BackgroundRefresh for %s (id: %s)", jwtPlugin.middlewareName, jwtPlugin.identifier)).print()
-	jwtPlugin.FetchKeys()
 	for {
 		select {
 		case keysFetchedChan := <-jwtPlugin.forceRefreshCmd:

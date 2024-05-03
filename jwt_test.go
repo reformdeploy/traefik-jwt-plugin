@@ -3,10 +3,12 @@ package traefik_jwt_plugin
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
+	"math/big"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -678,6 +680,74 @@ func TestForceRefreshKeys(t *testing.T) {
 		t.Fatalf("next.ServeHTTP was called: %d, expected: %d", nextCalled.Load(), concurrentReqNum)
 	}
 	if jwksCalledCounter > 2 {
+		t.Fatalf("jwks was called: %d times, expected: %d", jwksCalledCounter, 2)
+	}
+}
+
+func TestForceRefreshMultipleConfigsLoaded(t *testing.T) {
+	keys := `{"keys":[{"kty":"oct","kid":"57bd26a0-6209-4a93-a688-f8752be5d191","k":"eW91ci01MTItYml0LXNlY3JldA","alg":"HS512"}]}`
+	token := "Bearer eyJhbGciOiJIUzUxMiIsInR5cCI6IkpXVCIsImNyaXQiOlsia2lkIl0sImtpZCI6IjU3YmQyNmEwLTYyMDktNGE5My1hNjg4LWY4NzUyYmU1ZDE5MSJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiYWRtaW4iOnRydWUsImlhdCI6MTUxNjIzOTAyMn0.573ixRAw4I4XUFJwJGpv5dHNOGaexX5zTtF0nOQTWuU2_JyZjD-7cuMPxQUHOv8RR0kQrS0uVdo_N1lzTCPFnA"
+	jwksCalledCounter := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		defer func() { jwksCalledCounter++ }()
+		w.WriteHeader(http.StatusOK)
+		fmt.Println("jwks called:", time.Now())
+		if jwksCalledCounter < 1 {
+			fmt.Fprintln(w, `{"keys":[]}`)
+			return
+		}
+		time.Sleep(time.Second)
+		_, _ = fmt.Fprintln(w, keys)
+	})
+	ts := httptest.NewServer(mux)
+	defer ts.Close()
+
+	cfg := Config{
+		Keys:             []string{ts.URL},
+		ForceRefreshKeys: true,
+	}
+	ctx := context.Background()
+	var nextCalled atomic.Int64
+	next := http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) { nextCalled.Add(1) })
+
+	var opa http.Handler
+
+	cfgLoadedTimes := 10
+	var wg sync.WaitGroup
+	wg.Add(cfgLoadedTimes)
+	for i := 0; i < cfgLoadedTimes; i++ {
+		go func(wg *sync.WaitGroup) {
+			defer wg.Done()
+			randPeriod, err := rand.Int(rand.Reader, big.NewInt(1000))
+			if err != nil {
+				fmt.Println("failed to generate random period:", err)
+				randPeriod = big.NewInt(0)
+			}
+			time.Sleep(time.Microsecond * time.Duration(randPeriod.Int64()))
+			opa, _ = New(ctx, next, &cfg, "test-traefik-jwt-plugin")
+		}(&wg)
+	}
+	wg.Wait()
+
+	recorder := httptest.NewRecorder()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://localhost", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Add("Authorization", token)
+	opa.ServeHTTP(recorder, req)
+
+	resp := recorder.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status code %d, received %d", http.StatusOK, resp.StatusCode)
+	}
+
+	if int(nextCalled.Load()) != 1 {
+		t.Fatalf("next.ServeHTTP was called: %d, expected: %d", nextCalled.Load(), 1)
+	}
+	if jwksCalledCounter != 2 {
 		t.Fatalf("jwks was called: %d times, expected: %d", jwksCalledCounter, 2)
 	}
 }
