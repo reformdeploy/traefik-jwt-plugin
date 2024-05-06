@@ -713,20 +713,24 @@ func TestForceRefreshMultipleConfigsLoaded(t *testing.T) {
 
 	var opa http.Handler
 
-	cfgLoadedTimes := 10
+	cfgLoadedBatches := 10
+	cfgLoadedTimesPerBatch := 5
 	var wg sync.WaitGroup
-	wg.Add(cfgLoadedTimes)
-	for i := 0; i < cfgLoadedTimes; i++ {
-		go func(wg *sync.WaitGroup) {
-			defer wg.Done()
-			randPeriod, err := rand.Int(rand.Reader, big.NewInt(1000))
-			if err != nil {
-				fmt.Println("failed to generate random period:", err)
-				randPeriod = big.NewInt(0)
-			}
-			time.Sleep(time.Microsecond * time.Duration(randPeriod.Int64()))
-			opa, _ = New(ctx, next, &cfg, "test-traefik-jwt-plugin")
-		}(&wg)
+	for i := 0; i < cfgLoadedBatches; i++ {
+		randPeriod, err := rand.Int(rand.Reader, big.NewInt(1000))
+		if err != nil {
+			fmt.Println("failed to generate random period:", err)
+			randPeriod = big.NewInt(0)
+		}
+		for j := 0; j < cfgLoadedTimesPerBatch; j++ {
+			wg.Add(1)
+			go func(wg *sync.WaitGroup, randPeriod *big.Int) {
+				defer wg.Done()
+				opaInst, _ := New(ctx, next, &cfg, "test-traefik-jwt-plugin")
+				time.Sleep(time.Microsecond * time.Duration(randPeriod.Int64()))
+				opa = opaInst
+			}(&wg, randPeriod)
+		}
 	}
 	wg.Wait()
 

@@ -29,82 +29,105 @@ import (
 	"time"
 )
 
-type MiddlewarePlugins struct {
+type MiddlewarePluginManager struct {
 	selectedPluginId string
-	pluginCancelMap  map[string]context.CancelFunc
+	pluginCancelMap  sync.Map
 }
 
-func NewMiddlewarePlugins() *MiddlewarePlugins {
-	return &MiddlewarePlugins{
-		pluginCancelMap: make(map[string]context.CancelFunc),
-	}
+func NewMiddlewarePlugins() *MiddlewarePluginManager {
+	return &MiddlewarePluginManager{}
 }
 
-func (m *MiddlewarePlugins) OnPluginLoaded(ctx context.Context, jwtPlugin *JwtPlugin) {
-	if len(jwtPlugin.identifier) == 0 {
-		for {
-			b := make([]byte, 16)
-			rand.Read(b)
-			jwtPlugin.identifier = fmt.Sprintf("%X", b)
-			if _, ok := m.pluginCancelMap[jwtPlugin.identifier]; !ok {
-				break
-			}
+func (m *MiddlewarePluginManager) generateRandomPluginId() (id string) {
+	for {
+		b := make([]byte, 16)
+		rand.Read(b)
+		id = fmt.Sprintf("%X", b)
+		if _, ok := m.pluginCancelMap.Load(id); !ok {
+			return
 		}
+		// if generated id exists in map, continue to generate a new one
 	}
-	cancelCtx, cancelFunc := context.WithCancel(ctx)
+}
+
+func (m *MiddlewarePluginManager) OnPluginLoaded(jwtPlugin *JwtPlugin) {
+	if len(jwtPlugin.identifier) == 0 {
+		jwtPlugin.identifier = m.generateRandomPluginId()
+	}
+	if jwtPlugin.middlewareCtx == nil {
+		jwtPlugin.middlewareCtx = context.Background()
+	}
+	cancelCtx, cancelFunc := context.WithCancel(jwtPlugin.middlewareCtx)
 	jwtPlugin.cancelCtx = cancelCtx
-	m.pluginCancelMap[jwtPlugin.identifier] = cancelFunc
+	m.pluginCancelMap.Store(jwtPlugin.identifier, cancelFunc)
 
 	logInfo(fmt.Sprintf("JwtPlugin (id: %s) loaded for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
 }
 
-func (m *MiddlewarePlugins) SelectPlugin(jwtPlugin *JwtPlugin) {
+func (m *MiddlewarePluginManager) OnInstanceSelected(jwtPlugin *JwtPlugin) {
 	go func() {
-		for pluginId, cancelFunc := range m.pluginCancelMap {
+		m.pluginCancelMap.Range(func(key, value interface{}) bool {
+			pluginId, _ := key.(string)
 			if pluginId == jwtPlugin.identifier {
-				continue
+				return true
 			}
 			logInfo(fmt.Sprintf("JwtPlugin (id: %s) cancelled for middleware %s", pluginId, jwtPlugin.middlewareName)).print()
-			cancelFunc()
-			delete(m.pluginCancelMap, pluginId)
-		}
+			if cancelFunc, ok := value.(context.CancelFunc); ok {
+				cancelFunc()
+			}
+			m.pluginCancelMap.Delete(pluginId)
+			return true
+		})
 	}()
 
 	if jwtPlugin.identifier == m.selectedPluginId {
 		return
 	}
-
-	if _, ok := m.pluginCancelMap[jwtPlugin.identifier]; !ok {
+	if _, ok := m.pluginCancelMap.Load(jwtPlugin.identifier); !ok {
 		// should not happen on normal case
-		m.OnPluginLoaded(context.Background(), jwtPlugin)
+		m.OnPluginLoaded(jwtPlugin)
 	}
-
 	m.selectedPluginId = jwtPlugin.identifier
-	logInfo(fmt.Sprintf("JwtPlugin (id: %s) selected for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
+
 	if len(jwtPlugin.jwkEndpoints) > 0 {
 		jwtPlugin.FetchKeys()
 		go jwtPlugin.BackgroundRefresh()
 	}
+
+	logInfo(fmt.Sprintf("JwtPlugin (id: %s) selected for middleware %s", jwtPlugin.identifier, jwtPlugin.middlewareName)).print()
 }
 
-type PluginInstanceManager map[string]*MiddlewarePlugins
-
-func (m PluginInstanceManager) OnPluginLoaded(ctx context.Context, jwtPlugin *JwtPlugin) {
-	if _, ok := m[jwtPlugin.middlewareName]; !ok {
-		m[jwtPlugin.middlewareName] = NewMiddlewarePlugins()
-	}
-	m[jwtPlugin.middlewareName].OnPluginLoaded(ctx, jwtPlugin)
+type PluginInstanceManager struct {
+	sync.Map
 }
 
-func (m PluginInstanceManager) SelectPluginForMiddleware(jwtPlugin *JwtPlugin) {
-	if _, ok := m[jwtPlugin.middlewareName]; !ok {
-		m.OnPluginLoaded(context.Background(), jwtPlugin)
+func (m *PluginInstanceManager) getMiddlewareManager(middlewareName string) (midManager *MiddlewarePluginManager, isNewlyStored bool) {
+	midManagerAny, loaded := m.LoadOrStore(middlewareName, NewMiddlewarePlugins())
+	isNewlyStored = !loaded
+	var castOk bool
+	midManager, castOk = midManagerAny.(*MiddlewarePluginManager)
+	if !castOk {
+		panic("the value of PluginInstanceManager must be of type *MiddlewarePluginManager")
 	}
-	m[jwtPlugin.middlewareName].SelectPlugin(jwtPlugin)
+	return
+}
+
+func (m *PluginInstanceManager) OnPluginLoaded(jwtPlugin *JwtPlugin) {
+	if midManager, _ := m.getMiddlewareManager(jwtPlugin.middlewareName); midManager != nil {
+		midManager.OnPluginLoaded(jwtPlugin)
+	}
+}
+
+func (m *PluginInstanceManager) OnInstanceSelectedForMiddleware(jwtPlugin *JwtPlugin) {
+	midManager, isNewlyStored := m.getMiddlewareManager(jwtPlugin.middlewareName)
+	if isNewlyStored {
+		midManager.OnPluginLoaded(jwtPlugin)
+	}
+	midManager.OnInstanceSelected(jwtPlugin)
 }
 
 // Manager of plugin instances for each middleware. When a new configuration is loaded, the instance will be added to middleware map; when ServeHTTP of any plugin instance is called, this instance will be selected for the middleware and other instances will be cancelled & deleted, and background refresh routine stopped
-var pluginInstManager PluginInstanceManager = make(map[string]*MiddlewarePlugins)
+var pluginInstManager *PluginInstanceManager = &PluginInstanceManager{}
 
 // Config the plugin configuration.
 type Config struct {
@@ -161,6 +184,7 @@ type JwtPlugin struct {
 	identifier      string
 	keysLock        sync.RWMutex
 	forceRefreshCmd chan chan<- struct{}
+	middlewareCtx   context.Context
 	cancelCtx       context.Context
 }
 
@@ -273,8 +297,9 @@ func New(ctx context.Context, next http.Handler, config *Config, middlewareName 
 		jwtCookieKey:       config.JwtCookieKey,
 		jwtQueryKey:        config.JwtQueryKey,
 		middlewareName:     middlewareName,
+		middlewareCtx:      ctx,
 	}
-	pluginInstManager.OnPluginLoaded(ctx, jwtPlugin)
+	pluginInstManager.OnPluginLoaded(jwtPlugin)
 
 	if len(config.Keys) > 0 {
 		if err := jwtPlugin.ParseKeys(config.Keys); err != nil {
@@ -309,7 +334,10 @@ func (jwtPlugin *JwtPlugin) BackgroundRefresh() {
 // ackCurrentForceRefreshCmds acknowledge all current requested commands of forcing refresh keys
 func (jwtPlugin *JwtPlugin) ackCurrentForceRefreshCmds(consumedCmds ...chan<- struct{}) {
 	ackCmd := func(c chan<- struct{}) {
-		c <- struct{}{}
+		select {
+		case c <- struct{}{}:
+		case <-time.After(time.Second * 5):
+		}
 	}
 	var cmdCt int
 	defer func() {
@@ -401,7 +429,7 @@ func (jwtPlugin *JwtPlugin) ParseKeys(certificates []string) error {
 }
 
 func (jwtPlugin *JwtPlugin) FetchKeys() {
-	logInfo(fmt.Sprintf("FetchKeys - #%d jwkEndpoints to fetch", len(jwtPlugin.jwkEndpoints))).
+	logInfo(fmt.Sprintf("FetchKeys - #%d jwkEndpoints to fetch for %s (id: %s)", len(jwtPlugin.jwkEndpoints), jwtPlugin.middlewareName, jwtPlugin.identifier)).
 		print()
 	fetchedKeys := map[string]interface{}{}
 	for _, u := range jwtPlugin.jwkEndpoints {
@@ -526,7 +554,7 @@ func (jwtPlugin *JwtPlugin) FetchKeys() {
 }
 
 func (jwtPlugin *JwtPlugin) ServeHTTP(rw http.ResponseWriter, request *http.Request) {
-	pluginInstManager.SelectPluginForMiddleware(jwtPlugin)
+	pluginInstManager.OnInstanceSelectedForMiddleware(jwtPlugin)
 
 	if st, err := jwtPlugin.CheckToken(request, rw); err != nil {
 		if st >= 300 && st < 600 {
